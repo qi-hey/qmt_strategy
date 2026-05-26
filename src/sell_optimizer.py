@@ -1,34 +1,72 @@
-﻿# -*- coding: utf-8 -*-
-"""Self-learning sell optimizer.
+# -*- coding: utf-8 -*-
+"""Sell optimizer v2 — adaptive trailing stop + time decay + VWAP + volume.
 
-Strategy:
-- Max 3 batches per position
-- Batch 1 (35%): sell during morning surge (09:30-10:00), target +3%+
-- Batch 2 (35%): sell at intraday high detection (price drops 1% from peak)
-- Batch 3 (30%): sell remaining near close (14:55) at market
+Target: capture >70% of intraday range, monthly return >20%.
 
-Self-learning: tracks sell outcomes vs theoretical max, adjusts timing.
+Strategy layers (evaluated in order):
+  1. Opening gap — if gap >= 2%, sell 40% immediately
+  2. Dynamic trailing stop — tighter as profit grows, looser for big runners
+  3. Time decay — after 13:00, stops tighten progressively
+  4. VWAP anchor — prefer selling above VWAP
+  5. Volume spike — accelerate selling into high-volume candles
+  6. Hard stop-loss — never let a winner turn into a loser
+
+Three batches:
+  B1 (40%): morning momentum capture (gap sell or trailing stop)
+  B2 (35%): day-high hunting with trailing stop + VWAP guard
+  B3 (25%): closeout at 14:55:30 — market sell remaining
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 from typing import Any
 
 _log = logging.getLogger(__name__)
 
+FEE_RATE = 0.000085  # 0.0085%
+
+
+# —— trailing stop by profit zone ——————————————————————————————————————
+# (profit_pct, trail_pct_from_peak): sorted ascending; last match wins
+TRAIL_ZONES: list[tuple[float, float]] = [
+    (-99.0, 0.8),    # deep loss → tight 0.8% stop, cut quickly
+    (-2.0,  1.0),    # -2%~0% → 1% stop
+    (0.0,   1.2),    # 0%~2%   → 1.2% stop (protect breakeven)
+    (2.0,   1.8),    # 2%~4%   → 1.8% stop
+    (4.0,   2.5),    # 4%~7%   → 2.5% stop
+    (7.0,   3.5),    # 7%+     → 3.5% stop (let runners run)
+]
+
+# —— time decay: multiplier applied to trail distance ——————————————————
+# (start_hour, start_min, multiplier)
+TIME_DECAY: list[tuple[int, int, float]] = [
+    (9, 30,  1.00),    # patient in morning
+    (10, 30,  0.90),   # slight pressure
+    (13, 0,   0.75),   # afternoon begins
+    (14, 0,   0.55),   # getting late
+    (14, 30,  0.35),   # final stretch
+    (14, 50,  0.15),   # fire sale — just get out
+]
+
+# —— hard profit floor (trailing stop never goes below this profit %) ——
+PROFIT_FLOOR = 1.0
+
+# —— batch sizes ———————————————————————————————————————————————————————
+B1_RATIO = 0.40   # morning capture
+B2_RATIO = 0.35   # day-high hunting
+B3_RATIO = 0.25   # closeout
+
 
 @dataclass
 class SellBatch:
-    batch: int = 0        # 1, 2, or 3
-    ratio: float = 0.0     # percentage of position to sell
-    trigger: str = ""      # "morning_surge" / "peak_drop" / "closeout"
-    target_pct: float = 0.0
+    batch: int = 0
+    ratio: float = 0.0
+    trigger: str = ""
     sold: bool = False
     sell_price: float = 0.0
     sell_time: str = ""
@@ -39,35 +77,40 @@ class SellPlan:
     stock_code: str = ""
     total_volume: int = 0
     cost_price: float = 0.0
+    buy_date: str = ""
     batches: list[SellBatch] = field(default_factory=list)
     remaining: int = 0
+    intraday_peak: float = 0.0
+    day_open: float = 0.0
+    vwap: float = 0.0
+    gap_pct: float = 0.0
 
 
 @dataclass
-class PeakTracker:
-    """Track intraday peak for trailing-stop sell."""
-    peak_price: float = 0.0
-    peak_time: str = ""
-    current_price: float = 0.0
-    drawdown_pct: float = 0.0
+class MinuteBar:
+    """One minute of OHLCV data."""
+    time_str: str = ""
+    open: float = 0.0
+    high: float = 0.0
+    low: float = 0.0
+    close: float = 0.0
+    volume: int = 0
+    vwap: float = 0.0
 
 
 class SellOptimizer:
-    """Self-learning sell engine.
-
-    Tracks selling performance and adjusts strategy over time.
-    """
+    """Self-learning sell engine v2."""
 
     def __init__(self, data_dir: Path) -> None:
         self.data_dir = data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.history_path = self.data_dir / "sell_history.json"
+        self.config_path = self.data_dir / "sell_config.json"
         self._history: list[dict] = self._load_history()
-        self._peak_trackers: dict[str, PeakTracker] = {}
+        self._plans: dict[str, SellPlan] = {}
+        self._intraday_peaks: dict[str, float] = {}
 
-    # ------------------------------------------------------------------
-    # History / Learning
-    # ------------------------------------------------------------------
+    # —— history / learning ————————————————————————————————————————————
 
     def _load_history(self) -> list[dict]:
         if self.history_path.exists():
@@ -76,189 +119,390 @@ class SellOptimizer:
 
     def _save_history(self) -> None:
         self.history_path.write_text(
-            json.dumps(self._history[-500:], ensure_ascii=False, indent=2),
+            json.dumps(self._history[-1000:], ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
-    def record_sell(self, stock_code: str, cost: float, sell_prices: list[float],
-                    day_high: float, day_open: float) -> None:
-        """Record a completed sell to train the optimizer."""
+    def record_sell(self, stock_code: str, cost: float,
+                    sell_prices: list[float], sell_times: list[str],
+                    day_high: float, day_open: float, day_low: float,
+                    total_volume: int) -> dict:
+        """Record completed sell; return summary for learning."""
         if not sell_prices:
-            return
-        avg_sell = sum(sell_prices) / len(sell_prices)
-        theoretical_max = day_high
-        capture_rate = avg_sell / theoretical_max if theoretical_max > 0 else 0
+            return {}
 
-        self._history.append({
+        n = len(sell_prices)
+        if n == 1:
+            weights = [1.0]
+        elif n == 2:
+            w_sum = B1_RATIO + B2_RATIO
+            weights = [B1_RATIO / w_sum, B2_RATIO / w_sum]
+        else:
+            weights = [B1_RATIO, B2_RATIO, B3_RATIO]
+
+        avg_sell_w = sum(p * w for p, w in zip(sell_prices, weights))
+
+        gross_profit = (avg_sell_w / cost - 1) * 100 if cost > 0 else 0
+        net_profit = gross_profit - (FEE_RATE * 100 * 2) - 0.1  # fee both sides + stamp
+
+        record = {
             "date": datetime.now().strftime("%Y-%m-%d"),
             "code": stock_code,
-            "cost": cost,
-            "avg_sell": round(avg_sell, 2),
+            "cost": round(cost, 2),
+            "avg_sell": round(avg_sell_w, 2),
             "day_high": round(day_high, 2),
             "day_open": round(day_open, 2),
-            "capture_rate": round(capture_rate, 3),
-            "batches": len(sell_prices),
-            "profit_pct": round((avg_sell / cost - 1) * 100, 2),
-        })
+            "day_low": round(day_low, 2),
+            "capture_rate": round(avg_sell_w / day_high, 3) if day_high > 0 else 0,
+            "batches": n,
+            "gross_pct": round(gross_profit, 2),
+            "net_pct": round(net_profit, 2),
+            "vol": total_volume,
+        }
+        self._history.append(record)
         self._save_history()
 
+        recent = [r for r in self._history[-20:] if r["capture_rate"] > 0]
+        if len(recent) >= 10:
+            avg_cap = sum(r["capture_rate"] for r in recent) / len(recent)
+            if avg_cap < 0.60:
+                _log.info("Capture rate %.1f%% — consider tightening stops", avg_cap * 100)
+
+        return record
+
     def get_stats(self) -> dict:
-        """Get aggregated sell performance stats."""
         if not self._history:
             return {"avg_capture": 0, "avg_profit": 0, "total_trades": 0}
-        caps = [h["capture_rate"] for h in self._history]
-        profits = [h["profit_pct"] for h in self._history]
+        recent = self._history[-50:]
+        captures = [h["capture_rate"] for h in recent if h["capture_rate"] > 0]
+        profits = [h["net_pct"] for h in recent]
+        wins = [h for h in recent if h["net_pct"] > 0]
         return {
-            "avg_capture": round(sum(caps) / len(caps), 3),
-            "avg_profit": round(sum(profits) / len(profits), 2),
+            "avg_capture": round(sum(captures) / len(captures), 3) if captures else 0,
+            "avg_profit": round(sum(profits) / len(profits), 2) if profits else 0,
+            "win_rate": round(len(wins) / len(recent) * 100, 1) if recent else 0,
             "total_trades": len(self._history),
             "recent_5": self._history[-5:],
         }
 
-    # ------------------------------------------------------------------
-    # Sell plan creation
-    # ------------------------------------------------------------------
+    # —— sell plan —————————————————————————————————————————————————————
 
-    def create_plan(self, stock_code: str, volume: int, cost_price: float) -> SellPlan:
-        """Create a 3-batch sell plan for a position."""
+    def create_plan(self, stock_code: str, volume: int,
+                    cost_price: float, buy_date: str = "") -> SellPlan:
         batches = [
-            SellBatch(batch=1, ratio=0.35, trigger="morning_surge", target_pct=3.0),
-            SellBatch(batch=2, ratio=0.35, trigger="peak_drop", target_pct=5.0),
-            SellBatch(batch=3, ratio=0.30, trigger="closeout", target_pct=0.0),
+            SellBatch(batch=1, ratio=B1_RATIO, trigger="pending"),
+            SellBatch(batch=2, ratio=B2_RATIO, trigger="pending"),
+            SellBatch(batch=3, ratio=B3_RATIO, trigger="closeout"),
         ]
-        return SellPlan(
-            stock_code=stock_code,
-            total_volume=volume,
-            cost_price=cost_price,
-            batches=batches,
-            remaining=volume,
+        plan = SellPlan(
+            stock_code=stock_code, total_volume=volume,
+            cost_price=cost_price, buy_date=buy_date,
+            batches=batches, remaining=volume,
         )
+        self._plans[stock_code] = plan
+        return plan
 
-    # ------------------------------------------------------------------
-    # Morning surge detection (Batch 1)
-    # ------------------------------------------------------------------
+    # —— time decay factor —————————————————————————————————————————————
 
-    def check_morning_surge(self, stock_code: str, market: str,
-                            xtdata: Any, cost_price: float,
-                            current_time: str) -> tuple[bool, float]:
-        """Check if morning surge sell signal triggers.
+    @staticmethod
+    def _time_decay_factor(time_str: str) -> float:
+        """Return multiplier in [0, 1]; 1 = patient, 0 = sell everything now."""
+        try:
+            h, m = map(int, time_str.split(":")[:2])
+        except (ValueError, AttributeError):
+            return 1.0
+        factor = 1.0
+        for th, tm, mult in TIME_DECAY:
+            if h > th or (h == th and m >= tm):
+                factor = mult
+        return factor
 
-        Returns (should_sell, current_price).
+    # —— trail distance lookup —————————————————————————————————————————
+
+    @staticmethod
+    def _trail_pct(profit_pct: float, time_str: str = "09:30") -> float:
+        """Get trailing stop distance for current profit level, adjusted for time."""
+        trail = 1.0  # default
+        for lo, t in TRAIL_ZONES:
+            if profit_pct >= lo:
+                trail = t
+        factor = SellOptimizer._time_decay_factor(time_str)
+        return trail * factor
+
+    # —— compute bars from xtdata output ———————————————————————————————
+
+    @staticmethod
+    def _parse_bars(xtdata: Any, full_code: str, cost_price: float) -> list[MinuteBar]:
+        """Parse xtdata minute bars into normalized MinuteBar list."""
+        try:
+            df = xtdata.get_market_data_ex(
+                field_list=["close", "high", "low", "open", "volume"],
+                stock_list=[full_code],
+                period="1m",
+                start_time="", end_time="", count=240,
+            )
+        except Exception as e:
+            _log.debug("xtdata parse error: %s", e)
+            return []
+
+        if full_code not in df or df[full_code].empty:
+            return []
+
+        data = df[full_code]
+        bars: list[MinuteBar] = []
+        cum_vol = 0
+        cum_vp = 0.0  # volume * price
+        for i in range(len(data)):
+            try:
+                o = float(data["open"].iloc[i])
+                h = float(data["high"].iloc[i])
+                l = float(data["low"].iloc[i])
+                c = float(data["close"].iloc[i])
+                v = int(data["volume"].iloc[i])
+            except (ValueError, TypeError, IndexError):
+                continue
+            cum_vol += v
+            cum_vp += v * c
+            bars.append(MinuteBar(
+                open=o, high=h, low=l, close=c, volume=v,
+                vwap=cum_vp / cum_vol if cum_vol > 0 else c,
+                time_str=f"{i // 60 + 9:02d}:{i % 60:02d}",
+            ))
+        return bars
+
+    # —— THE CORE: evaluate sell signals ———————————————————————————————
+
+    def evaluate(self, stock_code: str, market: str,
+                 xtdata: Any, cost_price: float,
+                 current_time: str, volume: int,
+                 is_backtest: bool = False,
+                 backtest_bars: list[MinuteBar] | None = None,
+                 backtest_bar_index: int = 0) -> tuple[str, float]:
+        """Evaluate sell signals for the current minute.
+
+        Returns (action, price):
+          action = "sell_b1" | "sell_b2" | "sell_b3" | "hold"
+          price  = execution price for this batch
         """
         full_code = f"{stock_code}.{market}"
+
+        if is_backtest and backtest_bars is not None:
+            bars = backtest_bars[:backtest_bar_index + 1]
+            if not bars:
+                return "hold", 0.0
+            current = bars[-1].close
+            day_open = bars[0].open if bars else current
+            day_high = max(b.high for b in bars)
+            day_low = min(b.low for b in bars)
+            vwap = bars[-1].vwap
+        else:
+            bars = self._parse_bars(xtdata, full_code, cost_price)
+            if not bars:
+                return "hold", 0.0
+            current = bars[-1].close
+            day_open = bars[0].open if bars else current
+            day_high = max(b.high for b in bars)
+            day_low = min(b.low for b in bars)
+            vwap = bars[-1].vwap
+
+        profit_pct = (current / cost_price - 1) * 100
+        gap_pct = (day_open / cost_price - 1) * 100
+
+        # track intraday peak
+        key = f"{stock_code}_{cost_price}"
+        if key not in self._intraday_peaks:
+            self._intraday_peaks[key] = day_high
+        elif day_high > self._intraday_peaks[key]:
+            self._intraday_peaks[key] = day_high
+        peak = self._intraday_peaks[key]
+
+        # get plan
+        plan = self._plans.get(stock_code)
+        if plan is None:
+            return "hold", current
+
+        time_factor = self._time_decay_factor(current_time)
+        trail_dist = self._trail_pct(profit_pct, current_time)
+
+        # ——         # —— B1: opening gap sell ———————————————————————————————————
+        if not plan.batches[0].sold:
+            # Big gap up: sell immediately at open
+            if gap_pct >= 2.0:
+                _log.info("%s gap up %.1f%% → sell B1", stock_code, gap_pct)
+                return "sell_b1", day_open
+
+            # Gap down >3%: emergency cut B1 only (50% of position)
+            if gap_pct <= -3.0:
+                _log.info("%s gap down %.1f%% → emergency cut B1", stock_code, gap_pct)
+                return "sell_b1", day_open
+        # —— trailing stop check —————————————————————————————————————
+        trail_price = peak * (1 - trail_dist / 100)
+
+        # hard floor: don't let trailing stop go below profit floor
+        floor_price = cost_price * (1 + PROFIT_FLOOR / 100)
+        if profit_pct > PROFIT_FLOOR:
+            trail_price = max(trail_price, floor_price)
+
+        # —— stop-loss: if profit was ever >2% and now <0.5%, sell ——
+        stop_loss_triggered = False
+        if peak / cost_price - 1 >= 0.02 and profit_pct < 0.5:
+            stop_loss_triggered = True
+
+        # —— volume spike detection —————————————————————————————————
+        recent_vol = prev_vol = 0
+        vol_spike = False
+        if len(bars) >= 5:
+            recent_vol = sum(b.volume for b in bars[-3:])
+            if len(bars) >= 8:
+                prev_vol = sum(b.volume for b in bars[-8:-3]) / 5 * 3
+            else:
+                prev_vol = recent_vol
+            vol_spike = recent_vol > prev_vol * 2.5 and profit_pct > 1.0
+
+        # —— decide which batch ——————————————————————————————————————
+
+        h, m = 9, 30
         try:
-            df = xtdata.get_market_data_ex(
-                field_list=["close", "high", "volume"],
-                stock_list=[full_code],
-                period="1m",
-                start_time="", end_time="", count=30,
-            )
-        except Exception:
-            return False, 0.0
-
-        if full_code not in df or df[full_code].empty:
-            return False, 0.0
-
-        data = df[full_code]
-        close_prices = data["close"].tolist()
-        volumes = data["volume"].tolist()
-
-        if not close_prices:
-            return False, 0.0
-
-        current = close_prices[-1]
-        day_open = close_prices[0] if len(close_prices) > 1 else current
-
-        # Calculate profit %
-        profit_pct = (current / cost_price - 1) * 100 if cost_price > 0 else 0
-
-        # Signal: profit > 3% with increasing volume
-        if profit_pct >= 3.0:
-            recent_vol = sum(volumes[-3:]) if len(volumes) >= 3 else 0
-            prev_vol = sum(volumes[-6:-3]) if len(volumes) >= 6 else 0
-            vol_expanding = recent_vol > prev_vol * 1.2 if prev_vol > 0 else False
-
-            if vol_expanding:
-                return True, current
-
-        # Track peak
-        if stock_code not in self._peak_trackers:
-            self._peak_trackers[stock_code] = PeakTracker()
-        pk = self._peak_trackers[stock_code]
-
-        if current > pk.peak_price:
-            pk.peak_price = current
-            pk.peak_time = current_time
-
-        # Signal: dropped 1.5% from intraday peak (trailing stop)
-        if pk.peak_price > 0:
-            dd = (current - pk.peak_price) / pk.peak_price * 100
-            if dd <= -1.5 and profit_pct > 1.0:
-                return True, current
-
-        return False, current
-
-    # ------------------------------------------------------------------
-    # Peak drop detection (Batch 2)
-    # ------------------------------------------------------------------
-
-    def check_peak_drop(self, stock_code: str, market: str,
-                        xtdata: Any, cost_price: float) -> tuple[bool, float]:
-        """Check for peak-drop sell signal during the day."""
-        full_code = f"{stock_code}.{market}"
-        try:
-            df = xtdata.get_market_data_ex(
-                field_list=["close", "high"],
-                stock_list=[full_code],
-                period="1m",
-                start_time="", end_time="", count=240,  # full day
-            )
-        except Exception:
-            return False, 0.0
-
-        if full_code not in df or df[full_code].empty:
-            return False, 0.0
-
-        data = df[full_code]
-        highs = data["high"].tolist()
-        closes = data["close"].tolist()
-
-        if not closes or not highs:
-            return False, 0.0
-
-        current = closes[-1]
-        day_high = max(highs) if highs else current
-
-        profit_pct = (current / cost_price - 1) * 100 if cost_price > 0 else 0
-
-        # Sell if: reached 5%+ and now dropped 2% from high
-        if day_high / cost_price - 1 >= 0.05 and (current - day_high) / day_high * 100 <= -2.0:
-            return True, current
-
-        # Sell if: profit but price breaking below MA10
-        if len(closes) >= 10:
-            ma10 = sum(closes[-10:]) / 10
-            if current < ma10 and profit_pct > 0.5:
-                return True, current
-
-        return False, current
-
-    # ------------------------------------------------------------------
-    # Day high tracking
-    # ------------------------------------------------------------------
-
-    def get_day_high(self, stock_code: str, market: str, xtdata: Any) -> float:
-        """Get the highest price of the day so far."""
-        full_code = f"{stock_code}.{market}"
-        try:
-            df = xtdata.get_market_data_ex(
-                field_list=["high"],
-                stock_list=[full_code],
-                period="1d",
-                start_time="", end_time="", count=1,
-            )
-            if full_code in df and not df[full_code].empty:
-                return float(df[full_code]["high"].iloc[-1])
-        except Exception:
+            h, m = map(int, current_time.split(":")[:2])
+        except ValueError:
             pass
-        return 0.0
+
+        # B1: morning surge — sell on gap, trail stop, or vol spike before 11:00
+        if not plan.batches[0].sold:
+            if current <= trail_price and profit_pct > 0:
+                return "sell_b1", current
+            if stop_loss_triggered and h < 11:
+                return "sell_b1", current
+            if vol_spike and profit_pct >= 2.5 and h < 11:
+                return "sell_b1", current
+            # After 11:00, if B1 still unsold and profit > 1.5%, trigger
+            if h >= 11 and profit_pct > 1.5:
+                return "sell_b1", current
+
+        # B2: day-high hunting — sell on peak drop or trail stop
+        if plan.batches[0].sold and not plan.batches[1].sold:
+            # If in significant loss after B1 sold, use wider trail
+            # (let trailing stop handle it naturally)
+            if current <= trail_price:
+                return "sell_b2", current
+            if stop_loss_triggered:
+                return "sell_b2", current
+            # If profit > 5% and drops 2.5% from peak
+            peak_drop = (current - peak) / peak * 100
+            if profit_pct > 5.0 and peak_drop <= -2.5:
+                return "sell_b2", current
+            # After 14:30, be aggressive with B2
+            if h >= 14 and m >= 30 and profit_pct > 0.3:
+                return "sell_b2", current
+
+        # B3: closeout at 14:55:30
+        s = 0
+        try:
+            parts = current_time.replace(" ", ":").split(":")
+            if len(parts) >= 3:
+                s = int(parts[2])
+        except ValueError:
+            pass
+
+        # B3: closeout — sell remaining at 14:55:30
+        if h >= 14 and m >= 55 and s >= 30:
+            if not plan.batches[2].sold:
+                return "sell_b3", current
+
+        # If past 14:56:30 and any unsold
+        if h >= 14 and m >= 56 and s >= 30 and not plan.batches[2].sold:
+            return "sell_b3", current
+
+        return "hold", current
+
+    # —— execute batch mark ———————————————————————————————————————————
+
+    def mark_batch_sold(self, stock_code: str, batch: int,
+                        price: float, time_str: str) -> None:
+        plan = self._plans.get(stock_code)
+        if plan and 1 <= batch <= 3:
+            plan.batches[batch - 1].sold = True
+            plan.batches[batch - 1].sell_price = price
+            plan.batches[batch - 1].sell_time = time_str
+            plan.remaining = int(plan.total_volume * (
+                1 - sum(b.ratio for b in plan.batches if b.sold)
+            ))
+
+    def clear_plan(self, stock_code: str) -> None:
+        self._plans.pop(stock_code, None)
+        keys_to_del = [k for k in self._intraday_peaks if k.startswith(stock_code)]
+        for k in keys_to_del:
+            del self._intraday_peaks[k]
+
+    # —— backtest helper ————————————————————————————————————————————
+
+    def backtest_sell(self, stock_code: str, cost_price: float,
+                      minute_bars: list[MinuteBar], volume: int) -> dict:
+        """Simulate 3-batch sell on historical minute bars."""
+        self.create_plan(stock_code, volume, cost_price)
+        sell_prices: list[float] = []
+        sell_times: list[str] = []
+
+        market = "SH" if stock_code.startswith("6") else "SZ"
+
+        for i, bar in enumerate(minute_bars):
+            plan = self._plans.get(stock_code)
+            if plan and all(b.sold for b in plan.batches):
+                break
+
+            action, price = self.evaluate(
+                stock_code, market, None, cost_price,
+                bar.time_str, volume,
+                is_backtest=True, backtest_bars=minute_bars,
+                backtest_bar_index=i,
+            )
+            if action.startswith("sell_"):
+                batch_num = int(action[-1])
+                self.mark_batch_sold(stock_code, batch_num, price, bar.time_str)
+                if price > 0:
+                    sell_prices.append(price)
+                    sell_times.append(bar.time_str)
+
+        # force sell remaining at last bar
+        plan = self._plans.get(stock_code)
+        if plan:
+            last_bar = minute_bars[-1] if minute_bars else None
+            last_price = last_bar.close if last_bar else cost_price
+            last_time = last_bar.time_str if last_bar else "15:00"
+            for i, b in enumerate(plan.batches):
+                if not b.sold:
+                    b.sold = True
+                    b.sell_price = last_price
+                    b.sell_time = last_time
+                    b.trigger = "forced_close"
+                    sell_prices.append(last_price)
+                    sell_times.append(last_time)
+
+        day_high = max(b.high for b in minute_bars) if minute_bars else cost_price
+        day_low = min(b.low for b in minute_bars) if minute_bars else cost_price
+        day_open = minute_bars[0].open if minute_bars else cost_price
+
+        n = len(sell_prices)
+        if n == 1:
+            weights = [1.0]
+        elif n == 2:
+            w_sum = B1_RATIO + B2_RATIO
+            weights = [B1_RATIO / w_sum, B2_RATIO / w_sum]
+        else:
+            weights = [B1_RATIO, B2_RATIO, B3_RATIO]
+        avg_sell = sum(p * w for p, w in zip(sell_prices, weights)) / sum(weights) if weights else cost_price
+
+        self.clear_plan(stock_code)
+
+        return {
+            "code": stock_code, "cost": cost_price,
+            "avg_sell": round(avg_sell, 2),
+            "sell_prices": [round(p, 2) for p in sell_prices],
+            "sell_times": sell_times,
+            "day_open": round(day_open, 2),
+            "day_high": round(day_high, 2),
+            "day_low": round(day_low, 2),
+            "gross_pct": round((avg_sell / cost_price - 1) * 100, 2),
+            "net_pct": round((avg_sell / cost_price - 1) * 100 - 0.117, 2),
+            "batches": n,
+        }

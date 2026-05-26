@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """QMT Quantitative Trading Strategy - Main Entry Point.
 
 Flow:
@@ -210,75 +210,74 @@ def run_sell_phase(config: dict, trade_date: str) -> list[dict]:
     sell_results = []
     max_batches = cfg_trade.get("max_sell_batches", 3)
 
-    # Phase 1: Morning surge (09:30-10:00)
-    _log.info("=== Sell Phase 1: Morning Surge (09:30-10:00) ===")
-    monitor_until = "10:00"
-    while datetime.now().strftime("%H:%M") < monitor_until:
-        for code, plan in list(sell_plans.items()):
-            if plan.remaining <= 0:
-                continue
-            market = "SH" if code.startswith("6") else "SZ"
-            should_sell, price = optimizer.check_morning_surge(
-                code, market, xtdata, plan.cost_price,
-                datetime.now().strftime("%H:%M:%S"),
-            )
-            if should_sell and plan.batches[0].ratio > 0:
-                batch = plan.batches[0]
-                vol = trader.round_lot(int(plan.total_volume * batch.ratio))
-                if vol > 0:
-                    oid = trader.sell(code, 0, vol, f"morning_surge_{trade_date}")
-                    if oid:
-                        batch.sold = True
-                        batch.sell_price = price
-                        batch.sell_time = datetime.now().strftime("%H:%M:%S")
-                        plan.remaining -= vol
-                        sell_results.append({"code": code, "batch": 1, "price": price, "volume": vol, "trigger": "morning_surge"})
-                        _log.info("  SOLD %s x%d @ %.2f (morning surge)", code, vol, price)
-        time.sleep(10)
+    # === Unified sell loop using v2 adaptive optimizer ===
+    _log.info("=== Sell Phase: Adaptive Multi-Batch (v2) ===")
+    sell_complete = set()
+    deadline = datetime.strptime("14:56:40", "%H:%M:%S").time()
 
-    # Phase 2: Peak drop monitoring (10:00-14:55)
-    _log.info("=== Sell Phase 2: Peak Drop (10:00-14:55) ===")
-    monitor_until = "14:55"
-    while datetime.now().strftime("%H:%M") < monitor_until:
+    while datetime.now().time() < deadline:
+        now_str = datetime.now().strftime("%H:%M:%S")
         for code, plan in list(sell_plans.items()):
-            if plan.remaining <= 0:
+            if code in sell_complete or plan.remaining <= 0:
                 continue
-            if len([b for b in plan.batches if b.sold]) >= max_batches - 1:
-                continue  # save last batch for closeout
 
             market = "SH" if code.startswith("6") else "SZ"
-            should_sell, price = optimizer.check_peak_drop(
+            action, price = optimizer.evaluate(
                 code, market, xtdata, plan.cost_price,
+                now_str, plan.total_volume,
             )
-            if should_sell and plan.batches[1].ratio > 0:
-                batch = plan.batches[1]
-                vol = trader.round_lot(int(plan.total_volume * batch.ratio))
+
+            if action.startswith("sell_"):
+                batch_num = int(action[-1])
+                batch = plan.batches[batch_num - 1]
+                if batch.sold:
+                    continue
+
+                if batch_num == 3:
+                    vol = plan.remaining
+                else:
+                    vol = trader.round_lot(int(plan.total_volume * batch.ratio))
+
                 if vol > 0:
-                    oid = trader.sell(code, 0, vol, f"peak_drop_{trade_date}")
+                    trigger_name = {1: "morning", 2: "peak_trail", 3: "closeout"}.get(batch_num, "sell")
+                    oid = trader.sell(code, 0, vol, f"{trigger_name}_{trade_date}")
                     if oid:
-                        batch.sold = True
-                        batch.sell_price = price
-                        batch.sell_time = datetime.now().strftime("%H:%M:%S")
+                        optimizer.mark_batch_sold(code, batch_num, price, now_str)
                         plan.remaining -= vol
-                        sell_results.append({"code": code, "batch": 2, "price": price, "volume": vol, "trigger": "peak_drop"})
-                        _log.info("  SOLD %s x%d @ %.2f (peak drop)", code, vol, price)
-        time.sleep(15)
+                        sell_results.append({
+                            "code": code, "batch": batch_num, "price": price,
+                            "volume": vol, "trigger": trigger_name,
+                        })
+                        _log.info("  SOLD %s B%d x%d @ %.2f (%s)", code, batch_num, vol, price, trigger_name)
 
-    # Phase 3: Closeout at 14:55
-    _log.info("=== Sell Phase 3: Closeout (14:55) ===")
-    for code, plan in sell_plans.items():
-        if plan.remaining > 0:
-            vol = plan.remaining
-            oid = trader.sell(code, 0, vol, f"closeout_{trade_date}")
-            if oid:
-                sell_results.append({"code": code, "batch": 3, "price": 0, "volume": vol, "trigger": "closeout"})
-                _log.info("  SOLD %s x%d (closeout)", code, vol)
+                        if plan.remaining <= 0:
+                            sell_complete.add(code)
+                            # Record for learning
+                            all_prices = [b.sell_price for b in plan.batches if b.sold and b.sell_price > 0]
+                            if all_prices:
+                                optimizer.record_sell(
+                                    code, plan.cost_price, all_prices,
+                                    [b.sell_time for b in plan.batches if b.sold],
+                                    0, 0, 0, plan.total_volume,
+                                )
+                            optimizer.clear_plan(code)
+        time.sleep(5)
 
-            # Record for learning
-            day_high = optimizer.get_day_high(code, "SH" if code.startswith("6") else "SZ", xtdata)
-            sell_prices = [r["price"] for r in sell_results if r["code"] == code and r["price"] > 0]
-            if sell_prices:
-                optimizer.record_sell(code, plan.cost_price, sell_prices, day_high, 0)
+    # Force closeout for unsold positions
+    _log.info("=== Force Closeout ===")
+    for code, plan in list(sell_plans.items()):
+        if code in sell_complete or plan.remaining <= 0:
+            continue
+        vol = plan.remaining
+        oid = trader.sell(code, 0, vol, f"forced_close_{trade_date}")
+        if oid:
+            optimizer.mark_batch_sold(code, 3, 0, datetime.now().strftime("%H:%M:%S"))
+            sell_results.append({
+                "code": code, "batch": 3, "price": 0,
+                "volume": vol, "trigger": "forced_close",
+            })
+            _log.info("  FORCED SOLD %s x%d", code, vol)
+            optimizer.clear_plan(code)
 
     # Save sell record
     output_dir = Path(config.get("output_dir", "outputs"))
