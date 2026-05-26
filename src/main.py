@@ -35,7 +35,7 @@ def load_config(path: str = "config.json") -> dict:
     return json.loads(Path(path).read_text("utf-8"))
 
 
-def run_buy_phase(config: dict, trade_date: str) -> list[dict]:
+def run_buy_phase(config: dict, trade_date: str, simulate: bool = True) -> list[dict]:
     """Execute the buy phase (14:20-14:56)."""
     from .screener import candidates_to_stocks, load_screen_results
     from .minute_analyzer import MinuteAnalyzer
@@ -106,12 +106,12 @@ def run_buy_phase(config: dict, trade_date: str) -> list[dict]:
                 cfg_trade.get("position_ratio", 0.2),
             )
             if vol > 0:
-                oid = trader.buy(stock["code"], 0, vol,
+                oid = 99999 if simulate else trader.buy(stock["code"], 0, vol,
                                  f"uptrend_{trade_date}")
                 if oid:
                     available_cash -= vol * signal.latest_price
                     buy_results.append({**stock, "phase": "uptrend", "volume": vol, "price": signal.latest_price})
-                    _log.info("  => BOUGHT %s x%d", stock["code"], vol)
+                    _log.info("  => [SIM] BOUGHT %s x%d", stock["code"], vol)
             else:
                 watch_list.append(stock)
         else:
@@ -138,13 +138,13 @@ def run_buy_phase(config: dict, trade_date: str) -> list[dict]:
                         cfg_trade.get("position_ratio", 0.2),
                     )
                     if vol > 0:
-                        oid = trader.buy(stock["code"], 0, vol,
+                        oid = 99999 if simulate else trader.buy(stock["code"], 0, vol,
                                          f"dip_rebound_{trade_date}")
                         if oid:
                             available_cash -= vol * signal.latest_price
                             buy_results.append({**stock, "phase": "dip_rebound", "volume": vol, "price": signal.latest_price})
                             watch_list.remove(stock)
-                            _log.info("  => BOUGHT %s x%d (dip-rebound)", stock["code"], vol)
+                            _log.info("  => [SIM] BOUGHT %s x%d (dip-rebound)", stock["code"], vol)
 
             if not watch_list:
                 break
@@ -159,11 +159,11 @@ def run_buy_phase(config: dict, trade_date: str) -> list[dict]:
                     cfg_trade.get("position_ratio", 0.2),
                 )
                 if vol > 0:
-                    oid = trader.buy(stock["code"], 0, vol,
+                    oid = 99999 if simulate else trader.buy(stock["code"], 0, vol,
                                      f"deadline_{trade_date}")
                     if oid:
                         buy_results.append({**stock, "phase": "deadline", "volume": vol, "price": stock["price"]})
-                        _log.info("  => BOUGHT %s x%d (deadline)", stock["code"], vol)
+                        _log.info("  => [SIM] BOUGHT %s x%d (deadline)", stock["code"], vol)
 
     # Save buy record
     output_dir = Path(config.get("output_dir", "outputs"))
@@ -176,7 +176,7 @@ def run_buy_phase(config: dict, trade_date: str) -> list[dict]:
     return buy_results
 
 
-def run_sell_phase(config: dict, trade_date: str) -> list[dict]:
+def run_sell_phase(config: dict, trade_date: str, simulate: bool = True) -> list[dict]:
     """Execute the sell phase (next trading day)."""
     from .sell_optimizer import SellOptimizer
     from .trader import Trader
@@ -240,7 +240,7 @@ def run_sell_phase(config: dict, trade_date: str) -> list[dict]:
 
                 if vol > 0:
                     trigger_name = {1: "morning", 2: "peak_trail", 3: "closeout"}.get(batch_num, "sell")
-                    oid = trader.sell(code, 0, vol, f"{trigger_name}_{trade_date}")
+                    oid = 99999 if simulate else trader.sell(code, 0, vol, f"{trigger_name}_{trade_date}")
                     if oid:
                         optimizer.mark_batch_sold(code, batch_num, price, now_str)
                         plan.remaining -= vol
@@ -248,7 +248,7 @@ def run_sell_phase(config: dict, trade_date: str) -> list[dict]:
                             "code": code, "batch": batch_num, "price": price,
                             "volume": vol, "trigger": trigger_name,
                         })
-                        _log.info("  SOLD %s B%d x%d @ %.2f (%s)", code, batch_num, vol, price, trigger_name)
+                        _log.info("  => [SIM] SOLD %s B%d x%d @ %.2f (%s)", code, batch_num, vol, price, trigger_name)
 
                         if plan.remaining <= 0:
                             sell_complete.add(code)
@@ -269,7 +269,7 @@ def run_sell_phase(config: dict, trade_date: str) -> list[dict]:
         if code in sell_complete or plan.remaining <= 0:
             continue
         vol = plan.remaining
-        oid = trader.sell(code, 0, vol, f"forced_close_{trade_date}")
+        oid = 99999 if simulate else trader.sell(code, 0, vol, f"forced_close_{trade_date}")
         if oid:
             optimizer.mark_batch_sold(code, 3, 0, datetime.now().strftime("%H:%M:%S"))
             sell_results.append({
@@ -300,21 +300,27 @@ def main() -> None:
     parser.add_argument("--config", default="config.json")
     parser.add_argument("command", choices=["buy", "sell", "run"])
     parser.add_argument("--date", help="Trade date (YYYY-MM-DD)")
+    parser.add_argument("--live", action="store_true", default=False,
+                        help="REAL trading mode. Without this flag, runs in simulation only.")
     args = parser.parse_args()
 
     config = load_config(args.config)
     trade_date = args.date or datetime.now().strftime("%Y-%m-%d")
 
+    simulate = not getattr(args, "live", False)
+    if simulate:
+        _log.info("=== SIMULATION MODE - no real orders will be placed ===")
+    
     if args.command == "buy":
-        results = run_buy_phase(config, trade_date)
-        print(f"Buy phase complete: {len(results)} orders")
+        results = run_buy_phase(config, trade_date, simulate)
+        print(f"Buy phase complete: {len(results)} orders (LIVE={not simulate})")
     elif args.command == "sell":
-        results = run_sell_phase(config, trade_date)
-        print(f"Sell phase complete: {len(results)} orders")
+        results = run_sell_phase(config, trade_date, simulate)
+        print(f"Sell phase complete: {len(results)} orders (LIVE={not simulate})")
     elif args.command == "run":
         # Full day: buy + next-day sell
-        buy_results = run_buy_phase(config, trade_date)
-        print(f"Buy: {len(buy_results)} orders")
+        buy_results = run_buy_phase(config, trade_date, simulate)
+        print(f"Buy: {len(buy_results)} orders (LIVE={not simulate})")
         # Sell would run next day via separate invocation
 
 

@@ -1,0 +1,63 @@
+{
+  "period": "2025-06-01 -> 2026-05-26",
+  "stocks": 432,
+  "trading_days": 257,
+  "initial": 100000.0,
+  "final": 82174.27,
+  "total_return": -17.83,
+  "monthly_return": -1.59,
+  "win_rate": 45.3,
+  "avg_profit": -0.77,
+  "max_drawdown": 18.95,
+  "total_sells": 342,
+  "monthly_returns": [
+    {
+      "month": "2025-06",
+      "return_pct": -0.37
+    },
+    {
+      "month": "2025-07",
+      "return_pct": -3.9
+    },
+    {
+      "month": "2025-08",
+      "return_pct": -4.05
+    },
+    {
+      "month": "2025-09",
+      "return_pct": -1.25
+    },
+    {
+      "month": "2025-10",
+      "return_pct": 1.74
+    },
+    {
+      "month": "2025-11",
+      "return_pct": -5.43
+    },
+    {
+      "month": "2025-12",
+      "return_pct": 0.88
+    },
+    {
+      "month": "2026-01",
+      "return_pct": -4.37
+    },
+    {
+      "month": "2026-02",
+      "return_pct": 0.02
+    },
+    {
+      "month": "2026-03",
+      "return_pct": -1.08
+    },
+    {
+      "month": "2026-04",
+      "return_pct": 1.76
+    },
+    {
+      "month": "2026-05",
+      "return_pct": -2.5
+    }
+  ]
+}
