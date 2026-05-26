@@ -1,0 +1,172 @@
+{
+  "period": "2025-06-01 -> 2026-05-26",
+  "trading_days": 257,
+  "initial_capital": 100000.0,
+  "final_value": 112219.94,
+  "total_return": 12.22,
+  "monthly_return": 0.95,
+  "win_rate": 51.8,
+  "avg_profit": 0.36,
+  "max_drawdown": 3.68,
+  "total_sells": 199,
+  "trades": [
+    {
+      "date": "2026-05-18",
+      "code": "002760",
+      "action": "buy",
+      "price": 25.67,
+      "volume": 800
+    },
+    {
+      "date": "2026-05-18",
+      "code": "002976",
+      "action": "buy",
+      "price": 35.58,
+      "volume": 500
+    },
+    {
+      "date": "2026-05-19",
+      "code": "002760",
+      "action": "sell",
+      "buy_price": 25.67,
+      "sell_price": 26.4401,
+      "volume": 800,
+      "profit_pct": 3.0
+    },
+    {
+      "date": "2026-05-19",
+      "code": "002976",
+      "action": "sell",
+      "buy_price": 35.58,
+      "sell_price": 35.29,
+      "volume": 500,
+      "profit_pct": -0.82
+    },
+    {
+      "date": "2026-05-19",
+      "code": "002208",
+      "action": "buy",
+      "price": 25.12,
+      "volume": 800
+    },
+    {
+      "date": "2026-05-19",
+      "code": "603360",
+      "action": "buy",
+      "price": 24.0,
+      "volume": 700
+    },
+    {
+      "date": "2026-05-20",
+      "code": "002208",
+      "action": "sell",
+      "buy_price": 25.12,
+      "sell_price": 25.873600000000003,
+      "volume": 800,
+      "profit_pct": 3.0
+    },
+    {
+      "date": "2026-05-20",
+      "code": "603360",
+      "action": "sell",
+      "buy_price": 24.0,
+      "sell_price": 24.72,
+      "volume": 700,
+      "profit_pct": 3.0
+    },
+    {
+      "date": "2026-05-20",
+      "code": "605376",
+      "action": "buy",
+      "price": 137.45,
+      "volume": 100
+    },
+    {
+      "date": "2026-05-21",
+      "code": "605376",
+      "action": "sell",
+      "buy_price": 137.45,
+      "sell_price": 141.5735,
+      "volume": 100,
+      "profit_pct": 3.0
+    },
+    {
+      "date": "2026-05-22",
+      "code": "603936",
+      "action": "buy",
+      "price": 22.59,
+      "volume": 900
+    },
+    {
+      "date": "2026-05-25",
+      "code": "603936",
+      "action": "sell",
+      "buy_price": 22.59,
+      "sell_price": 23.2677,
+      "volume": 900,
+      "profit_pct": 3.0
+    },
+    {
+      "date": "2026-05-25",
+      "code": "001896",
+      "action": "buy",
+      "price": 16.92,
+      "volume": 1300
+    },
+    {
+      "date": "2026-05-25",
+      "code": "600936",
+      "action": "buy",
+      "price": 6.12,
+      "volume": 2900
+    },
+    {
+      "date": "2026-05-25",
+      "code": "600984",
+      "action": "buy",
+      "price": 5.07,
+      "volume": 2900
+    },
+    {
+      "date": "2026-05-26",
+      "code": "001896",
+      "action": "sell",
+      "buy_price": 16.92,
+      "sell_price": 16.51,
+      "volume": 1300,
+      "profit_pct": -2.42
+    },
+    {
+      "date": "2026-05-26",
+      "code": "600936",
+      "action": "sell",
+      "buy_price": 6.12,
+      "sell_price": 5.93,
+      "volume": 2900,
+      "profit_pct": -3.1
+    },
+    {
+      "date": "2026-05-26",
+      "code": "600984",
+      "action": "sell",
+      "buy_price": 5.07,
+      "sell_price": 5.06,
+      "volume": 2900,
+      "profit_pct": -0.2
+    },
+    {
+      "date": "2026-05-26",
+      "code": "603936",
+      "action": "buy",
+      "price": 26.24,
+      "volume": 800
+    },
+    {
+      "date": "2026-05-26",
+      "code": "600888",
+      "action": "buy",
+      "price": 11.27,
+      "volume": 1600
+    }
+  ]
+}

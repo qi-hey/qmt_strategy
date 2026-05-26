@@ -1,0 +1,7 @@
+cd qmt_strategy
+
+# 买入（14:20 开始监控）
+python -m src.main buy
+
+# 卖出（次日盘中自动运行）
+python -m src.main sell

@@ -1,0 +1,13 @@
+{
+  "period": "2025-12-01 -> 2026-05-26",
+  "stocks": 289,
+  "trading_days": 127,
+  "initial": 100000.0,
+  "final": 104994.41,
+  "total_return": 4.99,
+  "monthly_return": 0.81,
+  "win_rate": 47.8,
+  "avg_profit": 0.15,
+  "max_drawdown": 6.01,
+  "total_sells": 274
+}
