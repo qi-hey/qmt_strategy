@@ -1,0 +1,23 @@
+﻿{
+    "qmt_path": "D:/国金证券QMT交易端/userdata_mini",
+    "qmt_session": 0,
+    "account_id": "8887611017",
+    "account_type": "STOCK",
+    "screener_project": "../a_stock_strategy",
+    "data_dir": "data",
+    "output_dir": "outputs",
+    "trading": {
+        "fee_rate": 0.000085,
+        "t_plus_1": true,
+        "max_positions": 5,
+        "position_ratio": 0.2,
+        "max_sell_batches": 3,
+        "first_sell_ratio": 0.35,
+        "sell_monitor_start": "09:30",
+        "buy_monitor_start": "14:20",
+        "buy_deadline": "14:56:40",
+        "minute_window": 10,
+        "dip_rebound_pct": 1.5,
+        "trend_up_pct": 0.3
+    }
+}
