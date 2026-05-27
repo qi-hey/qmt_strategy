@@ -32,7 +32,7 @@ _log = logging.getLogger("qmt_strategy")
 
 
 def load_config(path: str = "config.json") -> dict:
-    return json.loads(Path(path).read_text("utf-8"))
+    return json.loads(Path(path).read_text("utf-8-sig"))
 
 
 def run_buy_phase(config: dict, trade_date: str, simulate: bool = True) -> list[dict]:
@@ -46,8 +46,11 @@ def run_buy_phase(config: dict, trade_date: str, simulate: bool = True) -> list[
     # Connect trader
     trader = Trader(config["qmt_path"], config["qmt_session"], config["account_id"])
     if not trader.connect():
-        _log.error("Cannot connect to QMT trader, aborting")
-        return []
+        if simulate:
+            _log.info("SIMULATION: Trader unavailable, running screen-only mode")
+        else:
+            _log.error("Cannot connect to QMT trader, aborting")
+            return []
 
     # Load screening results
     candidates = load_screen_results(config["screener_project"], trade_date)
@@ -185,8 +188,11 @@ def run_sell_phase(config: dict, trade_date: str, simulate: bool = True) -> list
 
     trader = Trader(config["qmt_path"], config["qmt_session"], config["account_id"])
     if not trader.connect():
-        _log.error("Cannot connect to QMT trader for sell phase")
-        return []
+        if simulate:
+            _log.info("SIMULATION: Trader unavailable, using xtdata for price monitoring only")
+        else:
+            _log.error("Cannot connect to QMT trader for sell phase")
+            return []
 
     optimizer = SellOptimizer(Path(config.get("data_dir", "data")))
 

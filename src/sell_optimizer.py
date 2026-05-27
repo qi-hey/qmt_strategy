@@ -42,6 +42,17 @@ TRAIL_ZONES: list[tuple[float, float]] = [
     (7.0,   3.5),    # 7%+     → 3.5% stop (let runners run)
 ]
 
+# B2 uses wider stops — more patience for remaining position
+TRAIL_ZONES_B2: list[tuple[float, float]] = [
+    (-99.0, 3.5),    # deep loss → 3.5% stop (survive violent swings)
+    (-2.0,  4.0),    # -2%~0% → 4% stop (let bounce happen)
+    (0.0,   4.5),    # 0%~2%   → 4.5% stop (very patient)
+    (2.0,   5.5),    # 2%~4%   → 5.5% stop
+    (4.0,   7.0),    # 4%~7%   → 7% stop
+    (7.0,   8.0),    # 7%+     → 8% stop (let big runners fly)
+]
+
+
 # —— time decay: multiplier applied to trail distance ——————————————————
 # (start_hour, start_min, multiplier)
 TIME_DECAY: list[tuple[int, int, float]] = [
@@ -57,9 +68,10 @@ TIME_DECAY: list[tuple[int, int, float]] = [
 PROFIT_FLOOR = 1.0
 
 # —— batch sizes ———————————————————————————————————————————————————————
-B1_RATIO = 0.40   # morning capture
-B2_RATIO = 0.35   # day-high hunting
-B3_RATIO = 0.25   # closeout
+B1_RATIO_MIN = 0.50   # min morning capture
+B1_RATIO_MAX = 0.75   # max morning capture
+# B2 takes the remaining (1 - B1 ratio)
+# B3 removed — dynamic B1 replaces fixed split
 
 
 @dataclass
@@ -135,10 +147,10 @@ class SellOptimizer:
         if n == 1:
             weights = [1.0]
         elif n == 2:
-            w_sum = B1_RATIO + B2_RATIO
-            weights = [B1_RATIO / w_sum, B2_RATIO / w_sum]
+            w_sum = 0.55 + 0.45
+            weights = [0.55 / w_sum, 0.45 / w_sum]
         else:
-            weights = [B1_RATIO, B2_RATIO, B3_RATIO]
+            weights = [0.55, 0.45]  # default, actual weights from plan
 
         avg_sell_w = sum(p * w for p, w in zip(sell_prices, weights))
 
@@ -187,12 +199,27 @@ class SellOptimizer:
 
     # —— sell plan —————————————————————————————————————————————————————
 
+    def _calc_b1_ratio(self, gap_pct: float, profit_at_open: float) -> float:
+        """Dynamic B1 ratio: 50-75% based on gap/profit."""
+        if gap_pct >= 5.0 or profit_at_open >= 5.0:
+            return 0.75
+        elif gap_pct >= 3.0 or profit_at_open >= 3.0:
+            return 0.68
+        elif gap_pct >= 2.0 or profit_at_open >= 2.0:
+            return 0.62
+        elif gap_pct >= 1.0 or profit_at_open >= 1.0:
+            return 0.55
+        else:
+            return 0.50
+
     def create_plan(self, stock_code: str, volume: int,
-                    cost_price: float, buy_date: str = "") -> SellPlan:
+                    cost_price: float, buy_date: str = "",
+                    gap_pct: float = 0.0, profit_at_open: float = 0.0) -> SellPlan:
+        b1_ratio = self._calc_b1_ratio(gap_pct, profit_at_open)
+        b2_ratio = 1.0 - b1_ratio
         batches = [
-            SellBatch(batch=1, ratio=B1_RATIO, trigger="pending"),
-            SellBatch(batch=2, ratio=B2_RATIO, trigger="pending"),
-            SellBatch(batch=3, ratio=B3_RATIO, trigger="closeout"),
+            SellBatch(batch=1, ratio=b1_ratio, trigger="pending"),
+            SellBatch(batch=2, ratio=b2_ratio, trigger="pending"),
         ]
         plan = SellPlan(
             stock_code=stock_code, total_volume=volume,
@@ -220,10 +247,16 @@ class SellOptimizer:
     # —— trail distance lookup —————————————————————————————————————————
 
     @staticmethod
-    def _trail_pct(profit_pct: float, time_str: str = "09:30") -> float:
-        """Get trailing stop distance for current profit level, adjusted for time."""
+    def _trail_pct(profit_pct: float, time_str: str = "09:30",
+                   batch: int = 1) -> float:
+        """Get trailing stop distance for current profit level, adjusted for time.
+        
+        batch=1: standard B1 trail
+        batch=2: wider B2 trail (2-3x more patient)
+        """
+        zones = TRAIL_ZONES_B2 if batch >= 2 else TRAIL_ZONES
         trail = 1.0  # default
-        for lo, t in TRAIL_ZONES:
+        for lo, t in zones:
             if profit_pct >= lo:
                 trail = t
         factor = SellOptimizer._time_decay_factor(time_str)
@@ -324,14 +357,32 @@ class SellOptimizer:
         time_factor = self._time_decay_factor(current_time)
         trail_dist = self._trail_pct(profit_pct, current_time)
 
-        # ——         # —— B1: opening gap sell ———————————————————————————————————
+        # ——         # —— B1: opening gap / early profit capture ————————————————
         if not plan.batches[0].sold:
-            # Big gap up: sell immediately at open
-            if gap_pct >= 2.0:
-                _log.info("%s gap up %.1f%% → sell B1", stock_code, gap_pct)
+            b1_ratio = plan.batches[0].ratio
+
+            # Big gap up >= 3%: sell B1 immediately at +3% from cost (lock profit)
+            if gap_pct >= 3.0 or profit_pct >= 3.0:
+                target_price = cost_price * 1.03
+                _log.info("%s gap/profit %.1f%% → B1 sell at +3%% target %.2f",
+                          stock_code, max(gap_pct, profit_pct), target_price)
+                # If current price is above +3% target, sell at current (better)
+                sell_at = max(current, target_price) if current > 0 else target_price
+                return "sell_b1", sell_at
+
+            # Moderate gap up 1-3%: sell B1 at current price (capture momentum)
+            if gap_pct >= 1.0:
+                _log.info("%s gap up %.1f%% → B1 sell at open %.2f",
+                          stock_code, gap_pct, day_open)
                 return "sell_b1", day_open
 
-            # Gap down >3%: emergency cut B1 only (50% of position)
+            # Profit > 2% without gap: sell B1 at current
+            if profit_pct >= 2.0:
+                _log.info("%s profit %.1f%% → B1 take profit at %.2f",
+                          stock_code, profit_pct, current)
+                return "sell_b1", current
+
+            # Gap down >3%: emergency cut B1
             if gap_pct <= -3.0:
                 _log.info("%s gap down %.1f%% → emergency cut B1", stock_code, gap_pct)
                 return "sell_b1", day_open
@@ -367,33 +418,90 @@ class SellOptimizer:
         except ValueError:
             pass
 
-        # B1: morning surge — sell on gap, trail stop, or vol spike before 11:00
+        # B1 still unsold? Use trailing stop as backup (gap was small or flat)
         if not plan.batches[0].sold:
             if current <= trail_price and profit_pct > 0:
                 return "sell_b1", current
             if stop_loss_triggered and h < 11:
                 return "sell_b1", current
-            if vol_spike and profit_pct >= 2.5 and h < 11:
+            if vol_spike and profit_pct >= 2.0 and h < 11:
                 return "sell_b1", current
-            # After 11:00, if B1 still unsold and profit > 1.5%, trigger
-            if h >= 11 and profit_pct > 1.5:
+            # After 10:30, if B1 still unsold and profit > 1%, trigger
+            if h >= 10 and m >= 30 and profit_pct > 1.0:
                 return "sell_b1", current
 
-        # B2: day-high hunting — sell on peak drop or trail stop
+        # B2: remaining position -- 3-4x wider trailing stop
         if plan.batches[0].sold and not plan.batches[1].sold:
-            # If in significant loss after B1 sold, use wider trail
-            # (let trailing stop handle it naturally)
-            if current <= trail_price:
+            # Wider trail for B2 (3-4x standard)
+            trail_dist_b2 = self._trail_pct(profit_pct, current_time, batch=2)
+            trail_price_b2 = peak * (1 - trail_dist_b2 / 100)
+
+            if current <= trail_price_b2:
                 return "sell_b2", current
-            if stop_loss_triggered:
+
+            # B2 deep stop-loss only
+            if profit_pct <= -2.0:
                 return "sell_b2", current
-            # If profit > 5% and drops 2.5% from peak
+
+            # If profit > 5% and drops 3.5% from peak
             peak_drop = (current - peak) / peak * 100
-            if profit_pct > 5.0 and peak_drop <= -2.5:
+            if profit_pct > 5.0 and peak_drop <= -3.5:
                 return "sell_b2", current
-            # After 14:30, be aggressive with B2
-            if h >= 14 and m >= 30 and profit_pct > 0.3:
+
+            # After 14:40, be aggressive
+            if h >= 14 and m >= 40 and profit_pct > 0:
                 return "sell_b2", current
+
+
+            if current <= trail_price_b2:
+                return "sell_b2", current
+
+            # B2 stop-loss: only trigger on DEEP loss (not mild retracement)
+            if profit_pct <= -2.0:
+                return "sell_b2", current
+
+            # If profit > 5% and drops 3.5% from peak
+            peak_drop = (current - peak) / peak * 100
+            if profit_pct > 5.0 and peak_drop <= -3.5:
+                return "sell_b2", current
+
+            # After 14:40, be aggressive with B2
+            if h >= 14 and m >= 40 and profit_pct > 0:
+                return "sell_b2", current
+
+
+            # If profit > 5% and drops 3.5% from peak
+            peak_drop = (current - peak) / peak * 100
+            if profit_pct > 5.0 and peak_drop <= -3.5:
+                return "sell_b2", current
+
+            # After 14:40, be aggressive with B2
+            if h >= 14 and m >= 40 and profit_pct > 0:
+                return "sell_b2", current
+
+
+            # After 14:40, be aggressive with B2
+            if h >= 14 and m >= 40 and profit_pct > 0:
+                return "sell_b2", current
+
+
+            # After cooling: use wider trail
+            if current <= trail_price_b2:
+                return "sell_b2", current
+
+            # B2 stop-loss: only trigger on DEEP loss (not mild retracement)
+            if profit_pct <= -2.0:
+                return "sell_b2", current
+
+            # If profit > 5% and drops 3.5% from peak (wider for B2)
+            peak_drop = (current - peak) / peak * 100
+            if profit_pct > 5.0 and peak_drop <= -3.5:
+                return "sell_b2", current
+
+            # After 14:40, be aggressive with B2
+            if h >= 14 and m >= 40 and profit_pct > 0:
+                return "sell_b2", current
+
 
         # B3: closeout at 14:55:30
         s = 0
@@ -439,7 +547,7 @@ class SellOptimizer:
     def backtest_sell(self, stock_code: str, cost_price: float,
                       minute_bars: list[MinuteBar], volume: int) -> dict:
         """Simulate 3-batch sell on historical minute bars."""
-        self.create_plan(stock_code, volume, cost_price)
+        self.create_plan(stock_code, volume, cost_price, gap_pct=0, profit_at_open=0)
         sell_prices: list[float] = []
         sell_times: list[str] = []
 
@@ -486,10 +594,10 @@ class SellOptimizer:
         if n == 1:
             weights = [1.0]
         elif n == 2:
-            w_sum = B1_RATIO + B2_RATIO
-            weights = [B1_RATIO / w_sum, B2_RATIO / w_sum]
+            w_sum = 0.55 + 0.45
+            weights = [0.55 / w_sum, 0.45 / w_sum]
         else:
-            weights = [B1_RATIO, B2_RATIO, B3_RATIO]
+            weights = [0.55, 0.45]  # default, actual weights from plan
         avg_sell = sum(p * w for p, w in zip(sell_prices, weights)) / sum(weights) if weights else cost_price
 
         self.clear_plan(stock_code)

@@ -96,11 +96,29 @@ class Backtest:
         """List all trading days between start and end (YYYYMMDD format)."""
         from xtquant import xtdata
         try:
+            # Try multiple formats
             days = xtdata.get_trading_dates("SH", start, end)
-            return [d for d in days if isinstance(d, str) and len(d) == 8]
-        except Exception:
-            # fallback: all weekdays
+            if not days:
+                # Try with shorter date format
+                days = xtdata.get_trading_dates("SH", start[:6], end[:6])
             result = []
+            for d in days:
+                if isinstance(d, str):
+                    d_clean = d.replace("-", "").replace("/", "")
+                    if len(d_clean) == 8:
+                        result.append(d_clean)
+                    elif len(d_clean) == 6:
+                        result.append(d_clean)
+                elif isinstance(d, int):
+                    result.append(str(d))
+            if result:
+                return result
+        except Exception as e:
+            _log.debug("QMT trading days failed: %s", e)
+        
+        # fallback: all weekdays
+        result = []
+        try:
             s = datetime.strptime(start[:8], "%Y%m%d")
             e = datetime.strptime(end[:8], "%Y%m%d")
             d = s
@@ -108,7 +126,19 @@ class Backtest:
                 if d.weekday() < 5:
                     result.append(d.strftime("%Y%m%d"))
                 d += timedelta(days=1)
-            return result
+        except ValueError:
+            # Try YYYY-MM-DD format
+            try:
+                s = datetime.strptime(start[:10], "%Y-%m-%d")
+                e = datetime.strptime(end[:10], "%Y-%m-%d")
+                d = s
+                while d <= e:
+                    if d.weekday() < 5:
+                        result.append(d.strftime("%Y%m%d"))
+                    d += timedelta(days=1)
+            except ValueError:
+                pass
+        return result
 
     def _get_code_market(self, code: str) -> str:
         return "SH" if code.startswith(("6", "9")) else "SZ"
@@ -119,19 +149,31 @@ class Backtest:
         """Get A-share universe for backtesting."""
         try:
             from xtquant import xtdata
-            # get all A shares
+            # Download sector data first
+            xtdata.download_sector_data()
             all_a = xtdata.get_stock_list_in_sector("沪深A股")
-            stocks = []
-            for code in all_a:
-                if code.startswith(("300", "301", "688")):
-                    continue  # skip 创业板/科创板
-                if len(code) != 6 or not code.isdigit():
-                    continue
-                stocks.append({"code": code, "market": self._get_code_market(code)})
-            return stocks
+            if all_a and len(all_a) > 100:
+                stocks = []
+                for code in all_a:
+                    if code.startswith(("300", "301", "688")):
+                        continue
+                    if len(code) != 6 or not code.isdigit():
+                        continue
+                    stocks.append({"code": code, "market": self._get_code_market(code)})
+                _log.info("QMT universe: %d stocks (from sector)", len(stocks))
+                return stocks
         except Exception as e:
-            _log.warning("QMT universe failed: %s, using fallback", e)
-            return []
+            _log.warning("QMT sector failed: %s", e)
+        
+        # Fallback: build from common codes
+        _log.info("Building fallback universe from code ranges...")
+        stocks = []
+        for i in range(0, 6000):
+            stocks.append({"code": f"60{i:04d}", "market": "SH"})
+        for i in range(0, 4000):
+            stocks.append({"code": f"00{i:04d}", "market": "SZ"})
+        # Sample to avoid overwhelming QMT
+        return stocks[::3][:1500]  # ~1500 stocks
 
     # —— daily bar cache ——————————————————————————————————————————————
 
