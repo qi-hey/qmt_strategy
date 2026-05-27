@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """QMT trading wrapper - buy/sell/position management."""
 
 from __future__ import annotations
@@ -62,12 +62,28 @@ class Trader:
             self._xt_trader.connect()
             time.sleep(1)
 
-            # Subscribe to account
-            self._xt_trader.subscribe(self.account_id)
+            # Get account info object (required for subscribe + queries)
+            acct_infos = self._xt_trader.query_account_infos()
+            self._account_obj = None
+            if acct_infos:
+                for info in acct_infos:
+                    if str(info.account_id) == str(self.account_id):
+                        self._account_obj = info
+                        break
+                if self._account_obj is None and acct_infos:
+                    self._account_obj = acct_infos[0]  # use first
+
+            if self._account_obj is None:
+                _log.error("No matching account found")
+                return False
+
+            # Subscribe using account object
+            self._xt_trader.subscribe(self._account_obj)
             time.sleep(0.5)
 
             self._connected = True
-            _log.info("QMT trader connected: account=%s", self.account_id)
+            _log.info("QMT trader connected: account=%s, type=%s",
+                      self.account_id, self._account_obj.account_type)
 
             # Load initial positions
             self._refresh_positions()
@@ -98,7 +114,7 @@ class Trader:
         if not self.is_connected:
             return {}
         try:
-            raw = self._xt_trader.query_stock_positions(self.account_id)
+            raw = self._xt_trader.query_stock_positions(self._account_obj)
             self._positions = {}
             for p in (raw or []):
                 code = p.stock_code.split(".")[0] if "." in p.stock_code else p.stock_code
@@ -136,7 +152,7 @@ class Trader:
         if not self.is_connected:
             return None
         try:
-            raw = self._xt_trader.query_stock_asset(self.account_id)
+            raw = self._xt_trader.query_stock_asset(self._account_obj)
             if raw:
                 return {
                     "total": float(getattr(raw, "total_asset", 0)),
@@ -168,7 +184,7 @@ class Trader:
 
         try:
             seq = self._xt_trader.order_stock(
-                self.account_id, full_code, order_type, volume,
+                self._account_obj, full_code, order_type, volume,
                 price_type, price, "qmt_strategy", remark,
             )
             _log.info("BUY order sent: %s %d shares @ %s (seq=%s)", stock_code, volume, price or "market", seq)
@@ -195,7 +211,7 @@ class Trader:
 
         try:
             seq = self._xt_trader.order_stock(
-                self.account_id, full_code, order_type, volume,
+                self._account_obj, full_code, order_type, volume,
                 price_type, price, "qmt_strategy", remark,
             )
             _log.info("SELL order sent: %s %d shares @ %s (seq=%s)", stock_code, volume, price or "market", seq)
@@ -213,7 +229,7 @@ class Trader:
         if not self.is_connected:
             return False
         try:
-            self._xt_trader.cancel_order_stock(self.account_id, order_id)
+            self._xt_trader.cancel_order_stock(self._account_obj, order_id)
             return True
         except Exception:
             return False
@@ -222,7 +238,7 @@ class Trader:
         if not self.is_connected:
             return []
         try:
-            raw = self._xt_trader.query_stock_orders(self.account_id)
+            raw = self._xt_trader.query_stock_orders(self._account_obj)
             result = []
             for o in (raw or []):
                 code = o.stock_code.split(".")[0] if "." in o.stock_code else o.stock_code
