@@ -430,23 +430,66 @@ class SellOptimizer:
             if h >= 10 and m >= 30 and profit_pct > 1.0:
                 return "sell_b1", current
 
-        # B2: remaining position -- 3-4x wider trailing stop
+        # B2: remaining position -- adaptive trail based on trend direction
         if plan.batches[0].sold and not plan.batches[1].sold:
-            # Wider trail for B2 (3-4x standard)
-            trail_dist_b2 = self._trail_pct(profit_pct, current_time, batch=2)
+            b1_sell_price = plan.batches[0].sell_price
+
+            # ---- Determine trend: did stock make new high after B1? ----
+            # Wait at least 10 bars after B1 before judging trend
+            use_wide_trail = True  # default: be patient during observation
+            if len(bars) >= 3 and b1_sell_price > 0:
+                # Find approximate B1 bar
+                b1_bar = -1
+                for j in range(len(bars) - 1, -1, -1):
+                    if abs(bars[j].close - b1_sell_price) < 0.03:
+                        b1_bar = j
+                        break
+                if b1_bar == -1:
+                    b1_bar = max(0, len(bars) // 3)
+
+                bars_after_b1 = len(bars) - b1_bar - 1
+                OBSERVATION_BARS = 12  # wait 12 minutes before judging
+
+                if bars_after_b1 >= OBSERVATION_BARS:
+                    # Enough data: check if any bar after B1 made higher close
+                    post_b1_closes = [b.close for b in bars[b1_bar+1:]]
+                    post_b1_high = max(post_b1_closes)
+                    if post_b1_high <= b1_sell_price * 1.002:
+                        # Failed to make new high after observation -> downtrend
+                        use_wide_trail = False
+                # else: still observing, keep wide trail
+
+            # Choose trail based on trend
+            trail_batch = 2 if use_wide_trail else 1
+            trail_dist_b2 = self._trail_pct(profit_pct, current_time, batch=trail_batch)
             trail_price_b2 = peak * (1 - trail_dist_b2 / 100)
 
             if current <= trail_price_b2:
                 return "sell_b2", current
 
-            # B2 deep stop-loss only
+            # Deep stop-loss
             if profit_pct <= -2.0:
                 return "sell_b2", current
 
-            # If profit > 5% and drops 3.5% from peak
+            # Big profit peak drop
             peak_drop = (current - peak) / peak * 100
             if profit_pct > 5.0 and peak_drop <= -3.5:
                 return "sell_b2", current
+
+            # After 14:40, aggressive
+            if h >= 14 and m >= 40 and profit_pct > 0:
+                return "sell_b2", current
+
+
+            # Big profit peak drop
+            peak_drop = (current - peak) / peak * 100
+            if profit_pct > 5.0 and peak_drop <= -3.5:
+                return "sell_b2", current
+
+            # After 14:40, aggressive
+            if h >= 14 and m >= 40 and profit_pct > 0:
+                return "sell_b2", current
+
 
             # After 14:40, be aggressive
             if h >= 14 and m >= 40 and profit_pct > 0:
